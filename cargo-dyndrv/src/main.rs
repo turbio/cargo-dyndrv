@@ -500,7 +500,9 @@ async fn main() -> eyre::Result<()> {
                 &Placeholder::standard_output(&OUTPUT_OUT).render().display(),
             );
 
-            add_long(&mut args, "crate-name", &unit.target.name.replace("-", "_"));
+            let crate_name = unit.target.name.replace("-", "_");
+            add_long(&mut args, "crate-name", &crate_name);
+            env.insert("CARGO_CRATE_NAME".into(), crate_name.into());
             add_long(&mut args, "edition", &unit.target.edition);
             add_long(&mut args, "crate-type", crate_type);
 
