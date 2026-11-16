@@ -470,6 +470,23 @@ async fn main() -> eyre::Result<()> {
             }
 
             env.insert("OPT_LEVEL".into(), unit.profile.opt_level.clone().into());
+            // cargo sets these for every build script; `built`, `cmake`, cc-based and many
+            // hand-written build.rs files unwrap them. NUM_JOBS is fixed so the derivation
+            // stays reproducible.
+            env.insert(
+                "PROFILE".into(),
+                (if unit.profile.name == "release" || unit.profile.name == "bench" {
+                    "release"
+                } else {
+                    "debug"
+                })
+                .into(),
+            );
+            env.insert(
+                "DEBUG".into(),
+                (if unit.profile.debuginfo != 0 { "true" } else { "false" }).into(),
+            );
+            env.insert("NUM_JOBS".into(), "8".into());
             env.insert("PATH".into(), path.into());
             (
                 Derivation {
