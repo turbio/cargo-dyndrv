@@ -442,11 +442,16 @@ async fn main() -> eyre::Result<()> {
                 .pkg_id
                 .rsplit_once('#')
                 .map(|(_, nv)| nv.split('@').next().unwrap_or(nv).to_string());
-            if let Some(extern_config) = all_extern_config.get(&unit.pkg_id).or_else(|| {
-                extern_name_key
-                    .as_deref()
-                    .and_then(|k| all_extern_config.get(k))
-            }) {
+            // the "*" entry (if any) applies to every unit without a more specific one
+            if let Some(extern_config) = all_extern_config
+                .get(&unit.pkg_id)
+                .or_else(|| {
+                    extern_name_key
+                        .as_deref()
+                        .and_then(|k| all_extern_config.get(k))
+                })
+                .or_else(|| all_extern_config.get("*"))
+            {
                 eprintln!("Handling external config for {}", unit.pkg_id);
                 for extra_input in &extern_config.inputs {
                     let store_path = StorePath::from_store_dir_str(&store_dir, extra_input)
@@ -487,6 +492,17 @@ async fn main() -> eyre::Result<()> {
                 (if unit.profile.debuginfo != 0 { "true" } else { "false" }).into(),
             );
             env.insert("NUM_JOBS".into(), "8".into());
+            // `built` unwraps RUSTDOC; av-scenechange and friends unwrap CARGO_ENCODED_RUSTFLAGS
+            // (cargo always sets it, empty when there are no extra flags)
+            {
+                use std::os::unix::ffi::OsStrExt as _;
+                let rustdoc = tools.rustc.real_path.with_file_name("rustdoc");
+                env.insert(
+                    "RUSTDOC".into(),
+                    rustdoc.as_os_str().as_bytes().to_vec().into(),
+                );
+            }
+            env.insert("CARGO_ENCODED_RUSTFLAGS".into(), "".into());
             env.insert("PATH".into(), path.into());
             (
                 Derivation {
