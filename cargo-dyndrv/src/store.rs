@@ -8,7 +8,7 @@ use std::{
 use color_eyre::eyre::{self, Context};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
 use harmonia_store_derivation::{
-    derivation::{Derivation, DerivationOutput},
+    derivation::{Derivation, DerivationOutput, StructuredAttrs},
     derived_path::{OutputName, SingleDerivedPath},
     placeholder::Placeholder,
 };
@@ -29,6 +29,21 @@ pub static PLATFORM: LazyLock<bytes::Bytes> =
 pub static OUTPUT_OUT: LazyLock<OutputName> = LazyLock::new(OutputName::default);
 pub static OUTPUT_FLAGS: LazyLock<OutputName> =
     LazyLock::new(|| OutputName::from_str("flags").unwrap());
+
+/// First argument that turns the binary into the builder of a `<name>-crates` derivation.
+pub const LINK_OUTPUTS_ARG: &str = "dyndrv-link-outputs";
+
+pub static OUTPUT_CRATES_DRV: LazyLock<OutputName> =
+    LazyLock::new(|| OutputName::from_str("crates.drv").unwrap());
+
+/// The output names the enclosing derivation declares. Nix exports them as `$outputs`; the
+/// per-output path variables are not usable here, since in structured-attrs mode names like
+/// `crates.drv` are not valid shell identifiers and never reach the builder.
+pub fn declared_outputs() -> std::collections::HashSet<String> {
+    std::env::var("outputs")
+        .map(|s| s.split_whitespace().map(String::from).collect())
+        .unwrap_or_default()
+}
 
 pub fn is_in_derivation() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
@@ -247,6 +262,63 @@ pub async fn submit_wrapper<T: DaemonStore>(
         )
         .await?;
 
+    Ok(())
+}
+
+/// Fill the enclosing derivation's `crates.drv` output with one derivation, D, whose outputs are
+/// the given crates' own derivations: output `<crate>-<version>.drv` of D is a copy of that unit's
+/// `.drv`, so `builtins.outputOf (builtins.outputOf <base>."crates.drv" "<crate>-<version>.drv") "out"`
+/// is the crate's build. D depends on the unit derivations as files only, never on their builds:
+/// asking for one crate builds that crate and its dependencies, nothing else of the lock file. The
+/// unit list travels in structured attrs (a file) and the builder is this binary in
+/// `LINK_OUTPUTS_ARG` mode, so the number of crates is not bounded by the builder's environment
+/// the way one output per crate on the enclosing derivation would be.
+pub async fn submit_crates<T: DaemonStore>(
+    store: &mut T,
+    store_dir: &StoreDir,
+    crates: &BTreeMap<String, StorePath>,
+) -> eyre::Result<()> {
+    let base_name = std::env::var("name")
+        .wrap_err("could not read derivation name, is this in nixpkgs stdenv?")?;
+    let drv_name = format!("{}-crates", base_name);
+    let me = Tool::current_exe(store_dir)?;
+
+    let mut outputs = BTreeMap::new();
+    let mut inputs = BTreeSet::from([SingleDerivedPath::Opaque(me.store_path.clone())]);
+    let mut units = serde_json::Map::new();
+    for (name, drv_path) in crates {
+        let output_name = format!("{}.drv", name);
+        outputs.insert(
+            OutputName::from_str(&output_name)?,
+            DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::Text),
+        );
+        inputs.insert(SingleDerivedPath::Opaque(drv_path.clone()));
+        units.insert(
+            output_name,
+            serde_json::Value::String(store_dir.display(drv_path).to_string()),
+        );
+    }
+
+    let drv = Derivation {
+        name: StorePathName::from_str(&drv_name)?,
+        outputs,
+        inputs,
+        platform: PLATFORM.clone(),
+        builder: me.real_path.clone_bytes(),
+        args: Vec::from([LINK_OUTPUTS_ARG.into()]),
+        env: BTreeMap::new(),
+        structured_attrs: Some(StructuredAttrs {
+            attrs: serde_json::Map::from_iter([(
+                "units".to_string(),
+                serde_json::Value::Object(units),
+            )]),
+        }),
+    };
+
+    let drv_path = add_drv_to_store(store, store_dir, drv, &drv_name).await?;
+    store
+        .submit_output(&SingleDerivedPath::Opaque(drv_path), &OUTPUT_CRATES_DRV)
+        .await?;
     Ok(())
 }
 

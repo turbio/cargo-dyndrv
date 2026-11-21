@@ -53,6 +53,20 @@ impl Tool {
         })
     }
 
+    /// The running cargo-dyndrv binary itself, for derivations that call back into it.
+    pub fn current_exe(store_dir: &StoreDir) -> eyre::Result<Self> {
+        let real_path = std::env::current_exe()
+            .wrap_err("could not locate the running binary")?
+            .canonicalize()?;
+        let store_path = containing_store_path(store_dir, &real_path).ok_or_else(|| {
+            eyre::eyre!("cargo-dyndrv ({}) is not in the Nix store", real_path.display())
+        })?;
+        Ok(Self {
+            store_path,
+            real_path,
+        })
+    }
+
     pub fn path_entry(&self) -> &[u8] {
         // any binary in the nix store should have a parent, it cannot be `/`
         self.real_path.parent().unwrap().as_os_str().as_bytes()

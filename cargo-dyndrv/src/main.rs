@@ -211,9 +211,38 @@ fn extern_declaration(
     ))
 }
 
+/// Builder of a `<name>-crates` derivation (`store::submit_crates`): every output is a copy of
+/// the unit derivation it stands for; both maps come from the structured attrs.
+fn link_outputs() -> eyre::Result<()> {
+    let attrs_path =
+        std::env::var("NIX_ATTRS_JSON_FILE").wrap_err("NIX_ATTRS_JSON_FILE is not set")?;
+    let attrs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&attrs_path)?)?;
+    let outputs = attrs["outputs"]
+        .as_object()
+        .ok_or_else(|| eyre::eyre!("no outputs in {}", attrs_path))?;
+    let units = attrs["units"]
+        .as_object()
+        .ok_or_else(|| eyre::eyre!("no units in {}", attrs_path))?;
+    for (name, path) in outputs {
+        let unit = units
+            .get(name)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| eyre::eyre!("no unit derivation for output {}", name))?;
+        let path = path
+            .as_str()
+            .ok_or_else(|| eyre::eyre!("output {} has no path", name))?;
+        std::fs::copy(unit, path).wrap_err_with(|| format!("copying {} to {}", unit, path))?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
+
+    if std::env::args().nth(1).as_deref() == Some(store::LINK_OUTPUTS_ARG) {
+        return link_outputs();
+    }
 
     // Someone might want a different one for some reason, idk how to get it
     let store_dir = StoreDir::default();
@@ -768,22 +797,15 @@ async fn main() -> eyre::Result<()> {
         }
     }
 
-    // Every library unit is also offered as its own output, named `<crate>-<version>`, when the
-    // enclosing derivation declares one (`outputs = [ "serde-1.0.200" ... ]` on the Nix side shows
-    // up as a `serde-1.0.200.drv` variable here). Dependencies of a crate thereby become
-    // addressable derivations of their own, so a flake can expose each crate of a lock file as
-    // a top-level package without rebuilding it per consumer.
-    if store::is_in_derivation() {
-        // Nix exports `outputs` (the space-separated output names) to the builder. The
-        // per-output path variables are not usable here: in structured-attrs mode names
-        // like `serde-1.0.200.drv` are not valid shell identifiers and never reach us.
-        let declared: std::collections::HashSet<String> = std::env::var("outputs")
-            .map(|s| s.split_whitespace().map(String::from).collect())
-            .unwrap_or_default();
-        let mut offered = std::collections::HashSet::new();
-        let mut submitted = 0usize;
+    // Every registry library unit is also offered through one `crates` derivation when the
+    // enclosing derivation declares a `crates.drv` output (`exposeCrates = true` on the Nix
+    // side): `builtins.outputOf <base>."crates.drv".outPath "<crate>-<version>"` is that unit's
+    // build. One output on the enclosing derivation covers any number of crates, which keeps the
+    // list out of the builder's environment; a 60k-crate lock file would overflow it otherwise.
+    if store::is_in_derivation() && store::declared_outputs().contains("crates.drv") {
+        let mut crates: BTreeMap<String, harmonia_store_path::StorePath> = BTreeMap::new();
         for (unit_idx, unit) in unit_graph.units.iter().enumerate() {
-            if unit.mode != CompileMode::Build {
+            if unit.mode != CompileMode::Build || !unit.pkg_id.starts_with("registry+") {
                 continue;
             }
             let lib_like = unit
@@ -801,19 +823,12 @@ async fn main() -> eyre::Result<()> {
             else {
                 continue;
             };
-            let out_name = format!("{}-{}", name, version);
-            let out_drv = format!("{}.drv", out_name);
-            let is_declared = declared.contains(&out_drv) || std::env::var_os(&out_drv).is_some();
-            if !is_declared || !offered.insert(out_name.clone()) {
-                continue;
-            }
-            let drv_path = &drv_cache[unit_idx].as_ref().unwrap().drv_path;
-            store::submit_wrapper(&mut store, &store_dir, &tools.ln, &out_name, drv_path).await?;
-            submitted += 1;
+            crates
+                .entry(format!("{}-{}", name, version))
+                .or_insert_with(|| drv_cache[unit_idx].as_ref().unwrap().drv_path.clone());
         }
-        if submitted > 0 {
-            eprintln!("submitted {} per-crate outputs", submitted);
-        }
+        store::submit_crates(&mut store, &store_dir, &crates).await?;
+        eprintln!("offered {} crates through crates.drv", crates.len());
     }
 
     // TODO: run the build if we are outside a derivation,
