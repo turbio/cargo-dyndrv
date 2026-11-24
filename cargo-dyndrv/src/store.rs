@@ -62,35 +62,25 @@ pub fn daemon_path() -> PathBuf {
     }
 }
 
-pub async fn add_to_store_nar<T: DaemonStore>(
+async fn add_to_store_nar<T: DaemonStore>(
     store: &mut T,
-    real_path: PathBuf,
+    real_path: &Path,
     name: &str,
 ) -> eyre::Result<StorePath> {
-    static CACHE_MUTEX: Mutex<Option<HashMap<PathBuf, StorePath>>> = Mutex::const_new(None);
-    let mut guard = CACHE_MUTEX.lock().await;
-    let cache = guard.get_or_insert_default();
-
-    if let Some(store_path) = cache.get(&real_path) {
-        Ok(store_path.clone())
-    } else {
-        // TODO: Don't put the entire nar in memory
-        let mut encoder = nix_nar::Encoder::new(&real_path)?;
-        let mut buf = Vec::new();
-        std::io::copy(&mut encoder, &mut buf)?;
-        let store_path = store
-            .add_ca_to_store(
-                name,
-                ContentAddressMethodAlgorithm::NixArchive(SHA256),
-                &Default::default(),
-                false,
-                buf.as_slice(),
-            )
-            .await?
-            .path;
-        cache.insert(real_path, store_path.clone());
-        Ok(store_path)
-    }
+    // TODO: Don't put the entire nar in memory
+    let mut encoder = nix_nar::Encoder::new(real_path)?;
+    let mut buf = Vec::new();
+    std::io::copy(&mut encoder, &mut buf)?;
+    Ok(store
+        .add_ca_to_store(
+            name,
+            ContentAddressMethodAlgorithm::NixArchive(SHA256),
+            &Default::default(),
+            false,
+            buf.as_slice(),
+        )
+        .await?
+        .path)
 }
 
 /// Adds a package's source to the store, along with any `include` paths from its extern
@@ -104,9 +94,21 @@ pub async fn add_package_source<T: DaemonStore>(
     include: &[String],
     name: &str,
 ) -> eyre::Result<(StorePath, PathBuf)> {
+    static CACHE_MUTEX: Mutex<Option<HashMap<PathBuf, (StorePath, PathBuf)>>> =
+        Mutex::const_new(None);
+    let mut guard = CACHE_MUTEX.lock().await;
+    let cache = guard.get_or_insert_default();
+    if let Some(cached) = cache.get(crate_root) {
+        return Ok(cached.clone());
+    }
+
     if include.is_empty() {
-        let src_path = add_to_store_nar(store, crate_root.to_path_buf(), name).await?;
+        let src_path = add_to_store_nar(store, crate_root, name).await?;
         let manifest_dir = src_path.to_absolute_path(store_dir);
+        cache.insert(
+            crate_root.to_path_buf(),
+            (src_path.clone(), manifest_dir.clone()),
+        );
         return Ok((src_path, manifest_dir));
     }
 
@@ -163,9 +165,13 @@ pub async fn add_package_source<T: DaemonStore>(
             .wrap_err_with(|| format!("could not include {}", source.display()))?;
     }
 
-    let src_path = add_to_store_nar(store, staging.clone(), name).await?;
+    let src_path = add_to_store_nar(store, &staging, name).await?;
     std::fs::remove_dir_all(&staging)?;
     let manifest_dir = src_path.to_absolute_path(store_dir).join(package_relative);
+    cache.insert(
+        crate_root.to_path_buf(),
+        (src_path.clone(), manifest_dir.clone()),
+    );
     Ok((src_path, manifest_dir))
 }
 
